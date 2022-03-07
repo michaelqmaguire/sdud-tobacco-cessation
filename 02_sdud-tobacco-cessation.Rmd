@@ -1,0 +1,205 @@
+---
+title: "State Drug Utilization - Tobacco Cessation in Kentucky"
+author: 'Michael Q. Maguire, MS'
+date: 'February 17, 2022'
+always_allow_html: true
+output: html_document
+---
+  
+## Packages Used
+  
+```{r packageLoad, message = FALSE}
+library(tidyverse)
+library(data.table)
+library(DT)
+library(httr)
+library(rvest)
+library(hrbrthemes)
+library(readxl)
+```
+
+```{r sdudFile, include = FALSE}
+file_location <- 'C:/Users/michaelqmaguire2/Dropbox (UFL)/01_projects/medicaid-drug-utilization/medicaid-drug-utilization/data/clean/03_sdud-redbook-final.csv'
+```
+
+## Read in the SDUD data set
+
+```{r sdudLoad}
+sdud <- fread(
+  file_location,
+  colClasses = c('proper_ndc' = 'character')
+)
+```
+
+## Read in AG NDC file.
+
+## Subset to Florida Only and Create MOUD Flags
+
+```{r NDC}
+ndc <- readxl::read_excel('./data/raw/Chantix varenicline NDC codes.xlsx')
+
+ndc_patterns <- ndc |>
+  tidyr::separate('Chantix_Varenicline_NDC', into = c('code1', 'code2', 'code3'), sep = '-', remove = FALSE) |>
+  mutate(
+    pattern = paste0(nchar(trimws(code1)), nchar(trimws(code2)), nchar(trimws(code3))),
+    ndcnum = case_when(
+      pattern == '532' ~ paste0(code1, paste0("0", code2), code3),
+      pattern == '442' ~ paste0(paste0("0", code1), code2, code3),
+      pattern == '443' ~ paste0(paste0("0", code1), code2, code3),
+      pattern == '541' ~ paste0(code1, code2, paste0("0", code3)),
+      TRUE ~ 'Pattern not matched'
+    )
+  )
+
+ndc_chantix <- ndc_patterns$ndcnum
+```
+
+Variable `moudFlag` represents whether the brand name has a pattern match with the below values.
+Variable `medication` represents the categorization according to AG.
+
+```{r sdudFL}
+sdudTobacco <- sdud[
+  i = (data.table::between(year, 2012, 2021) & proper_ndc %in% ndc_chantix),
+  j = .(utilization.type, state, year, quarter, suppression, proper_ndc, gennme, prodnme, numberrx)
+][,
+  `:=` (yearQuarter = zoo::as.yearqtr(format(paste0(year, quarter)), "%Y%q"))
+  ]
+```
+
+The following NDC's were found in this data base:
+
+```{r specificNDC}
+received_ndc <- length(ndc_chantix)
+matched_ndc <- length(unique(sdudTobacco$proper_ndc))
+
+paste0("Proportion matched to SDUD: ", round(matched_ndc / received_ndc, 2))
+```
+
+## Aggregating overall numbers by State
+
+```{r aggregateOverall}
+sdudTobaccoAggState <- sdudTobacco[
+  i = suppression == 'F',
+  j = .(totalRX = sum(numberrx)),
+  by = .(yearQuarter, state)]
+
+setorder(sdudTobaccoAggState, state, yearQuarter)
+```
+
+```{r plot, fig.width = 18, fig.height = 10}
+sdudTobaccoAggState |> filter(state == 'KY') |>
+  ggplot() +
+  geom_col(aes(x = as.factor(yearQuarter), y = totalRX, fill = as.factor(yearQuarter)), color = 'black') +
+  ggtitle("State Drug Utilization Data - Tobacco Cessation Products in Kentucky, 2012 - 2021") +
+  xlab('Year - Quarter') +
+  ylab('Total Units Dispensed') +
+  theme_ipsum_rc(grid = 'Y') +
+  theme(axis.text.x = element_text(angle = 90, size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.position = 'none') +
+  scale_fill_viridis_d()
+```
+
+
+## Other States
+
+```{r, test}
+noKy <- sdudTobaccoAggState[sdudTobaccoAggState$state != 'KY', ]
+
+noKyFormatted <- copy(noKy)
+
+noKyFormatted <- noKyFormatted[,  `:=` (yearQtrF = as.character(yearQuarter), yearQuarter = NULL)][, j = .(state, yearQtrF, totalRX)]
+
+datatable(noKyFormatted)
+```
+
+## Pull in Medicaid Enrollment numbers from CDC API
+
+```{r, apiPull}
+url <- 'https://data.medicaid.gov/api/1/datastore/query/6c114b2c-cb83-559b-832f-4d8b06d6c1b9/0'
+
+postResponse <- httr::POST(url)
+
+postToChar <- rawToChar(postResponse$content)
+
+charToJSON <- jsonlite::fromJSON(postToChar)
+
+medicaidEnrollment <- as.data.table(charToJSON$results)
+```
+
+```{r, kyFromAPI}
+medicaidEnrollmentKY <- medicaidEnrollment[i = (state == 'Kentucky')]
+
+medicaidEnrollmentKYQtr <- copy(medicaidEnrollmentKY)
+
+medicaidEnrollmentKYQtr <- medicaidEnrollmentKYQtr[ , `:=` (quarter = fcase(enrollment_month %in% c('1', '2', '3'), 1,
+                                                                               enrollment_month %in% c('4', '5', '6'), 2,
+                                                                               enrollment_month %in% c('7', '8', '9'), 3,
+                                                                               enrollment_month %in% c('10', '11', '12'), 4,
+                                                                               default = 5))][ ,
+                                                                                 `:=` (yearQuarter = zoo::as.yearqtr(format(paste0(enrollment_year, quarter)), "%Y%q"),
+                                                                                       totalEnrollees = as.numeric(total_medicaid_enrollees))
+                                                                               ]
+
+setorder(medicaidEnrollmentKYQtr, yearQuarter)
+
+medicaidEnrollmentKYQtr |> janitor::tabyl(enrollment_month, quarter)
+
+medicaidEnrollmentKYQtr |> janitor::tabyl(yearQuarter, quarter)
+```
+
+## Aggregate Medicaid Enrollment Numbers for KY
+
+```{r, kyMedicaidAgg}
+medicaidEnrollmentKyAgg <- medicaidEnrollmentKYQtr[ , .(enrolleesPerQtr = sum(totalEnrollees) / 3), by = .(state, yearQuarter)]
+
+setorder(medicaidEnrollmentKyAgg, yearQuarter)
+
+sdudTobaccoAggStateKy <- sdudTobaccoAggState[i = (state == 'KY')][, `:=` (stateFull = 'Kentucky')]
+
+setorder(sdudTobaccoAggStateKy, yearQuarter)
+
+sdudWMedicaid <- sdudTobaccoAggStateKy[medicaidEnrollmentKyAgg, on = .(yearQuarter)]
+
+sdudMedicaidFinal <- sdudWMedicaid[, `:=` (ratePer1k = (totalRX / enrolleesPerQtr) * 1000)]
+```
+
+## Plotting Medicaid Enrollees per Quarter in KY
+
+```{r, medicaidPopAgg, fig.width = 18, fig.height = 10}
+medicaidPopulationPlot <- sdudMedicaidFinal |> ggplot() +
+  geom_col(aes(x = as.factor(yearQuarter), y = enrolleesPerQtr, fill = as.factor(yearQuarter)), color = 'black') +
+  scale_fill_viridis_d() +
+  theme_ipsum_rc(grid = 'Y') +
+  theme(legend.position = 'none', axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14), axis.text.x = element_text(color = 'black'), axis.text.y = element_text(color = 'black')) +
+  ggtitle("Total Medicaid Enrollees in KY, 2014 - 2020") +
+  xlab("Year - Quarter") +
+  ylab("Total Enrollees")
+  
+medicaidPopulationPlot
+
+jpeg(paste0('./plots/', format(Sys.Date(), '%Y%m%d'), "_ky-medicaid-pop.jpeg"), width = 18, height = 10, units = 'in', res = 1200)
+medicaidPopulationPlot
+dev.off()
+```
+
+## Plotting Chantix Rate per 1k
+
+```{r, chantixPer1k, fig.width = 18, fig.height = 10}
+chantixPer1k <- sdudMedicaidFinal |> ggplot() +
+  geom_col(aes(x = as.factor(yearQuarter), y = ratePer1k, fill = as.factor(yearQuarter)), color = 'black') +
+  scale_fill_viridis_d() +
+  theme_ipsum_rc(grid = 'Y') +
+  theme(legend.position = 'none', axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14), axis.text.x = element_text(color = 'black'), axis.text.y = element_text(color = 'black')) +
+  ggtitle("Varenicline Dispensed in Kentucky per 1,000 Medicaid Enrollees") +
+  xlab("Year - Quarter") +
+  ylab("Rate per 1,000 Enrollees")
+
+chantixPer1k
+
+jpeg(paste0('./plots/', format(Sys.Date(), '%Y%m%d'), "_ky-varenicline-per-1k.jpeg"), width = 18, height = 10, units = 'in', res = 1200)
+chantixPer1k
+dev.off()
+```
